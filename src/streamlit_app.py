@@ -2,6 +2,7 @@ import streamlit as st
 import json
 import random
 import os
+import ast
 from datetime import datetime, timedelta
 
 # --- スプレッドシート通信用ライブラリ ---
@@ -14,8 +15,7 @@ except ImportError:
 
 # --- パス設定 ---
 BASE_DIR = os.path.dirname(__file__)
-DATA_PATH = os.path.join(BASE_DIR, '../data/questions.json')
-PROGRESS_PATH = os.path.join(BASE_DIR, '../progress/user_progress.json')
+PROGRESS_PATH = os.path.join(BASE_DIR, '../progress/user_progress.json') # ローカルバックアップ用
 SECRET_PATH = os.path.join(BASE_DIR, '../secret.json')
 
 # --- スタイリング ---
@@ -24,8 +24,8 @@ st.markdown("""
     .main { background-color: #f0f2f6; }
     .stButton>button { width: 100%; border-radius: 12px; height: 3.5em; font-weight: bold; transition: 0.2s; }
     .q-card { background-color: #ffffff !important; color: #000000 !important; padding: 30px; border-radius: 20px; border-left: 10px solid #3498db; box-shadow: 0 5px 15px rgba(0,0,0,0.1); margin-bottom: 25px; }
-    .feedback-correct { background-color: #e8f8f5 !important; color: #0b5345 !important; padding: 25px; border-radius: 15px; border: 2px solid #2ecc71; font-size: 1.1em; font-weight: bold; }
-    .feedback-wrong { background-color: #fbeee6 !important; color: #78281f !important; padding: 25px; border-radius: 15px; border: 2px solid #e74c3c; font-size: 1.1em; font-weight: bold; }
+    .feedback-correct { background-color: #e8f8f5 !important; color: #0b5345 !important; padding: 25px; border-radius: 15px; border: 2px solid #2ecc71; font-size: 1.1em; font-weight: bold; margin-bottom: 15px; }
+    .feedback-wrong { background-color: #fbeee6 !important; color: #78281f !important; padding: 25px; border-radius: 15px; border: 2px solid #e74c3c; font-size: 1.1em; font-weight: bold; margin-bottom: 15px; }
     .stat-label { font-size: 0.9em; color: #7f8c8d; font-weight: bold; }
     .stat-value { font-size: 1.8em; font-weight: bold; color: #3498db; }
 </style>
@@ -59,21 +59,66 @@ def get_next_review(interval):
     next_date = base_date + timedelta(days=interval)
     return datetime(next_date.year, next_date.month, next_date.day, 7, 0, 0).isoformat()
 
-# --- クラウド同期機能（セキュリティ対応版） ---
+# --- クラウド同期機能 (GSpread) ---
 def get_gspread_client():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    
-    # 1. Streamlit Cloud上で動かしている場合（st.secretsから読み込む）
     if "gcp_service_account" in st.secrets:
         creds_dict = dict(st.secrets["gcp_service_account"])
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    # 2. ローカルパソコンで動かしている場合（secret.jsonから読み込む）
     elif os.path.exists(SECRET_PATH):
         creds = ServiceAccountCredentials.from_json_keyfile_name(SECRET_PATH, scope)
     else:
         raise Exception("鍵（secret）が見つかりません。")
-        
     return gspread.authorize(creds)
+
+# ★ 【新規追加】 スプレッドシートから問題データを直接取得してキャッシュする
+@st.cache_data(ttl=3600) # 1時間キャッシュ（重くならないように）
+def load_questions_from_cloud():
+    if not GSPREAD_AVAILABLE:
+        st.error("スプレッドシート通信ライブラリがありません。")
+        return []
+    try:
+        client = get_gspread_client()
+        sheet = client.open("grammar_data")
+        ws_q = sheet.worksheet("Questions") # "Questions"というシート名を作成してください
+        records = ws_q.get_all_records()
+        
+        q_data = []
+        for row in records:
+            # optionsが文字列の場合（[A, B] や A, B, C など）をリストに変換
+            options_raw = str(row.get('options', '')).strip()
+            if options_raw:
+                try:
+                    options = ast.literal_eval(options_raw) if options_raw.startswith('[') else [o.strip() for o in options_raw.split(',')]
+                except:
+                    options = [o.strip() for o in options_raw.split(',')]
+            else:
+                options = []
+
+            # 答えの処理（選択式ならインデックス、記述式ならテキストそのまま）
+            ans_raw = row.get('answer', '')
+            if options:
+                try: ans = int(ans_raw)
+                except: ans = 0
+                correct_answer = options[ans] if 0 <= ans < len(options) else ""
+            else:
+                ans = str(ans_raw)
+                correct_answer = str(ans_raw)
+
+            q_data.append({
+                "id": int(row.get('id', 0)),
+                "section": int(row.get('section', 0)),
+                "question": str(row.get('question', '')),
+                "options": options,
+                "answer": ans,
+                "correct_answer": correct_answer,
+                "explanation": str(row.get('explanation', '')),
+                "translation": str(row.get('translation', ''))
+            })
+        return q_data
+    except Exception as e:
+        st.error(f"問題データの取得に失敗しました: {str(e)}")
+        return []
 
 def sync_to_cloud(p_data):
     if not GSPREAD_AVAILABLE: return False, "ライブラリがありません。"
@@ -92,8 +137,8 @@ def sync_to_cloud(p_data):
     except Exception as e:
         return False, f"通信エラー: {str(e)}"
 
-def load_from_cloud():
-    if not GSPREAD_AVAILABLE: return False, "ライブラリがありません。"
+def load_progress_from_cloud():
+    if not GSPREAD_AVAILABLE: return False, "ライブラリがありません。", {}
     try:
         client = get_gspread_client()
         sheet = client.open("grammar_data")
@@ -102,22 +147,20 @@ def load_from_cloud():
         if val:
             cloud_data = json.loads(val)
             save_p(cloud_data)
-            return True, "クラウドからデータをロードしました！"
-        return False, "クラウドにデータがありません。"
+            return True, "クラウドからデータをロードしました！", cloud_data
+        return False, "クラウドにデータがありません。", {}
     except Exception as e:
-        return False, f"通信エラー: {str(e)}"
+        return False, f"通信エラー: {str(e)}", {}
 
-# --- データ管理 ---
-def load_all():
-    q = []
-    p = {}
-    if os.path.exists(DATA_PATH):
-        with open(DATA_PATH, 'r', encoding='utf-8') as f: q = json.load(f)
-    if os.path.exists(PROGRESS_PATH):
+# プログレスデータのローカルロード＆初期化
+def load_progress(cloud_data=None):
+    p = cloud_data if cloud_data else {}
+    if not p and os.path.exists(PROGRESS_PATH):
         try:
             with open(PROGRESS_PATH, 'r', encoding='utf-8') as f: p = json.load(f)
         except: pass
 
+    # 初期化ロジック
     if "stats" not in p: p["stats"] = {"streak": 0, "last_date": "", "today_count": 0, "history": {}}
     if "history" not in p["stats"]: p["stats"]["history"] = {}
     if "seq_progress" not in p["stats"]: p["stats"]["seq_progress"] = {"ALL": 0}
@@ -125,6 +168,7 @@ def load_all():
     if "review_list" not in p: p["review_list"] = []
     if "chapter_wrongs" not in p: p["chapter_wrongs"] = []
     
+    # 古いデータの互換性維持
     if "items" not in p:
         items_dict = {}
         for k, v in list(p.items()):
@@ -133,7 +177,7 @@ def load_all():
                 del p[k]
         p["items"] = items_dict
 
-    return q, p
+    return p
 
 def save_p(p):
     os.makedirs(os.path.dirname(PROGRESS_PATH), exist_ok=True)
@@ -147,19 +191,29 @@ def sm2_update(ease, interval):
     ease = min(3.0, ease + 0.1)
     return ease, interval
 
-# --- ★ オートロード機能（アプリ起動時に1回だけ実行） ★ ---
+# --- 記述式の正誤判定 ---
+def check_text_answer(user_input, correct_ans):
+    return str(user_input).strip().lower() == str(correct_ans).strip().lower()
+
+# --- ★ オートロード機能 ★ ---
 if 'auto_loaded' not in st.session_state:
     st.session_state.auto_loaded = False
+    st.session_state.cloud_p_data = {}
 
 if not st.session_state.auto_loaded:
-    load_from_cloud() # 裏側で静かにロードする
+    success, msg, data = load_progress_from_cloud()
+    if success:
+        st.session_state.cloud_p_data = data
     st.session_state.auto_loaded = True
 
-# 初期化
-q_data, p_data = load_all()
+# ★データ初期化（スプレッドシートから読み込み）
+q_data = load_questions_from_cloud()
+p_data = load_progress(st.session_state.cloud_p_data)
+
 now = datetime.now()
 today_str = now.strftime("%Y-%m-%d")
 
+# ストリーク（連続日数）と今日の記録の更新
 if p_data["stats"].get("last_date") != today_str:
     yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
     if p_data["stats"].get("last_date") == yesterday: p_data["stats"]["streak"] += 1
@@ -170,6 +224,7 @@ if p_data["stats"].get("last_date") != today_str:
     if today_str not in p_data["stats"]["history"]: p_data["stats"]["history"][today_str] = 0
     save_p(p_data)
 
+# セッションステート初期化
 if 'view' not in st.session_state: st.session_state.view = "HOME"
 if 'queue' not in st.session_state: st.session_state.queue = []
 if 'idx' not in st.session_state: st.session_state.idx = 0
@@ -203,11 +258,17 @@ with st.sidebar:
             
     if st.button("⬇️ ロードする"):
         with st.spinner("通信中..."):
-            success, msg = load_from_cloud()
+            success, msg, data = load_progress_from_cloud()
             if success: 
+                st.session_state.cloud_p_data = data
                 st.success(msg)
                 st.rerun()
             else: st.error(msg)
+            
+    if st.button("🔄 問題データを再読み込み"):
+        load_questions_from_cloud.clear()
+        st.success("スプレッドシートから問題データを再取得しました！")
+        st.rerun()
     
     st.divider()
     st.write("📝 **現在の苦手リスト**")
@@ -222,6 +283,10 @@ with st.sidebar:
 # --- メイン画面 ---
 if st.session_state.view == "HOME":
     st.title("英文法 忘却曲線マスター Pro")
+
+    if not q_data:
+        st.warning("⚠️ 問題データが読み込めていません。スプレッドシートに「Questions」シートがあるか確認してください。")
+        st.stop()
 
     tab_seq, tab_rand, tab_eb, tab_chap, tab_review, tab_record = st.tabs([
         "📖 順番に解く", "🎲 ランダム", "🧠 エビングハウス", "📚 章別学習", "♻️ 復習", "📅 記録"
@@ -337,29 +402,44 @@ elif st.session_state.view == "QUIZ":
         st.markdown(f'<div class="q-card"><b>Question:</b><br>{q["question"]}</div>', unsafe_allow_html=True)
 
         if not st.session_state.ans_flag:
-            cols = st.columns(2)
-            if 'options' in q and q['options']:
+            # --- 選択式 or 記述式の判定 ---
+            is_mcq = 'options' in q and isinstance(q['options'], list) and len(q['options']) > 0
+
+            if is_mcq:
+                cols = st.columns(2)
                 for i, opt in enumerate(q['options']):
-                    if cols[i % 2].button(f"{i+1}. {opt}", key=f"opt_{i}"):
+                    # optionsに中身があればボタン表示
+                    if cols[i % 2].button(f"{i+1}. {opt}", key=f"opt_{q['id']}_{i}"):
                         st.session_state.ans_flag = True
                         st.session_state.is_correct = (i == q['answer'])
                         st.rerun()
+            else:
+                user_ans = st.text_input("✍️ 答えを入力してください", key=f"text_ans_{q['id']}")
+                if st.button("回答を送信", type="primary"):
+                    if user_ans.strip():
+                        st.session_state.ans_flag = True
+                        st.session_state.is_correct = check_text_answer(user_ans, q.get('correct_answer', ''))
+                        st.rerun()
+                    else:
+                        st.warning("答えを入力してください。")
             
+            st.write("")
             if st.button("🤔 わからない (苦手リストに追加)", type="secondary"):
                 st.session_state.ans_flag = True
                 st.session_state.is_correct = False
                 st.rerun()
+
         else:
             if st.session_state.is_correct:
                 st.markdown('<div class="feedback-correct">⭕ 正解です！素晴らしい！</div>', unsafe_allow_html=True)
             else:
-                correct_txt = q['options'][q['answer']] if 'options' in q else q.get('correct_answer')
+                correct_txt = q['correct_answer']
                 st.markdown(f'<div class="feedback-wrong">❌ 不正解...<br>正解: {correct_txt}</div>', unsafe_allow_html=True)
             
-            st.write(f"**【日本語訳】** {q.get('translation') or q.get('hint_translation')}")
-            st.info(f"**【解説】**\n{q['explanation']}")
+            st.write(f"**【日本語訳】** {q.get('translation', '設定なし')}")
+            st.info(f"**【解説】**\n{q.get('explanation', '解説はありません。')}")
             
-            if st.button("次の問題へ ➡️"):
+            if st.button("次の問題へ ➡️", type="primary"):
                 qid = str(q['id'])
                 is_correct = st.session_state.is_correct
 
@@ -419,6 +499,6 @@ elif st.session_state.view == "QUIZ":
             p_data["stats"]["seq_progress"][st.session_state.seq_key] = 0
             save_p(p_data)
 
-        if st.button("ホームへ戻る"):
+        if st.button("🏠 ホームへ戻る", type="primary"):
             st.session_state.view = "HOME"
             st.rerun()
