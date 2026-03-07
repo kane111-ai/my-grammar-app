@@ -71,8 +71,8 @@ def get_gspread_client():
         raise Exception("鍵（secret）が見つかりません。")
     return gspread.authorize(creds)
 
-# ★ 【新規追加】 スプレッドシートから問題データを直接取得してキャッシュする
-@st.cache_data(ttl=3600) # 1時間キャッシュ（重くならないように）
+# ★ 【修正済み】 画像の独自フォーマット対応・見出し無し対応版 ★
+@st.cache_data(ttl=3600)
 def load_questions_from_cloud():
     if not GSPREAD_AVAILABLE:
         st.error("スプレッドシート通信ライブラリがありません。")
@@ -80,41 +80,66 @@ def load_questions_from_cloud():
     try:
         client = get_gspread_client()
         sheet = client.open("grammar_data")
-        ws_q = sheet.worksheet("Questions") # "Questions"というシート名を作成してください
-        records = ws_q.get_all_records()
+        ws_q = sheet.worksheet("Questions")
         
+        # 見出しがないシートでも読めるように get_all_values() を使用
+        records = ws_q.get_all_values()
+        if not records: return []
+
+        # 1行目が見出し（"id"など）ならスキップし、そうでないなら0行目から読み込む
+        start_idx = 1 if records[0] and str(records[0][0]).lower() == 'id' else 0
+
         q_data = []
-        for row in records:
-            # optionsが文字列の場合（[A, B] や A, B, C など）をリストに変換
-            options_raw = str(row.get('options', '')).strip()
-            if options_raw:
-                try:
-                    options = ast.literal_eval(options_raw) if options_raw.startswith('[') else [o.strip() for o in options_raw.split(',')]
-                except:
-                    options = [o.strip() for o in options_raw.split(',')]
-            else:
-                options = []
+        for i, row in enumerate(records[start_idx:]):
+            # エラー防止：列数が足りない場合は空文字で埋める
+            row = row + [''] * (10 - len(row))
 
-            # 答えの処理（選択式ならインデックス、記述式ならテキストそのまま）
-            ans_raw = row.get('answer', '')
-            if options:
-                try: ans = int(ans_raw)
-                except: ans = 0
-                correct_answer = options[ans] if 0 <= ans < len(options) else ""
-            else:
-                ans = str(ans_raw)
-                correct_answer = str(ans_raw)
+            # A列(0): ID, B列(1): Section, C列(2): 問題
+            q_id = int(row[0]) if str(row[0]).isdigit() else (i + 1)
+            section = int(row[1]) if str(row[1]).isdigit() else 0
+            question = str(row[2])
 
-            q_data.append({
-                "id": int(row.get('id', 0)),
-                "section": int(row.get('section', 0)),
-                "question": str(row.get('question', '')),
-                "options": options,
-                "answer": ans,
-                "correct_answer": correct_answer,
-                "explanation": str(row.get('explanation', '')),
-                "translation": str(row.get('translation', ''))
-            })
+            ans_raw = str(row[7]).strip() # H列の値
+
+            # H列が「1〜4」などの数字なら【選択式】、そうでないなら【記述式】と判定
+            if ans_raw.isdigit() and len(ans_raw) == 1:
+                # --- 選択式問題 ---
+                # D(3), E(4), F(5), G(6)列を選択肢としてリスト化
+                options = [str(row[3]), str(row[4]), str(row[5]), str(row[6])]
+                options = [opt for opt in options if opt.strip() != '']
+                
+                # スプレッドシート上の答えが「4」なら、プログラム用に「3」(0スタート)に変換
+                ans_idx = int(ans_raw) - 1
+                correct_answer = options[ans_idx] if 0 <= ans_idx < len(options) else ""
+                explanation = str(row[8]) # I列が解説
+                
+                q_data.append({
+                    "id": q_id,
+                    "section": section,
+                    "question": question,
+                    "options": options,
+                    "answer": ans_idx,
+                    "correct_answer": correct_answer,
+                    "explanation": explanation,
+                    "translation": ""
+                })
+            else:
+                # --- 記述式問題 ---
+                # H列が数字じゃない（解説が入っている）場合
+                correct_answer = str(row[3]).strip() # D列を答えとする
+                explanation = str(row[7]) # H列を解説とする
+                
+                q_data.append({
+                    "id": q_id,
+                    "section": section,
+                    "question": question,
+                    "options": [],
+                    "answer": correct_answer,
+                    "correct_answer": correct_answer,
+                    "explanation": explanation,
+                    "translation": ""
+                })
+
         return q_data
     except Exception as e:
         st.error(f"問題データの取得に失敗しました: {str(e)}")
@@ -285,7 +310,7 @@ if st.session_state.view == "HOME":
     st.title("英文法 忘却曲線マスター Pro")
 
     if not q_data:
-        st.warning("⚠️ 問題データが読み込めていません。スプレッドシートに「Questions」シートがあるか確認してください。")
+        st.warning("⚠️ 問題データが読み込めていません。スプレッドシートの「Questions」シートの構成を確認してください。")
         st.stop()
 
     tab_seq, tab_rand, tab_eb, tab_chap, tab_review, tab_record = st.tabs([
@@ -436,7 +461,8 @@ elif st.session_state.view == "QUIZ":
                 correct_txt = q['correct_answer']
                 st.markdown(f'<div class="feedback-wrong">❌ 不正解...<br>正解: {correct_txt}</div>', unsafe_allow_html=True)
             
-            st.write(f"**【日本語訳】** {q.get('translation', '設定なし')}")
+            if q.get('translation'):
+                st.write(f"**【日本語訳】** {q.get('translation')}")
             st.info(f"**【解説】**\n{q.get('explanation', '解説はありません。')}")
             
             if st.button("次の問題へ ➡️", type="primary"):
