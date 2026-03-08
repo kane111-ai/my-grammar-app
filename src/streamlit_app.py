@@ -71,7 +71,7 @@ def get_gspread_client():
         raise Exception("鍵（secret）が見つかりません。")
     return gspread.authorize(creds)
 
-# ★ 【修正済み】 画像の独自フォーマット対応・見出し無し対応版 ★
+# ★ 【修正完了】スプレッドシートの列構成（A〜J列）に完全一致させました ★
 @st.cache_data(ttl=3600)
 def load_questions_from_cloud():
     if not GSPREAD_AVAILABLE:
@@ -82,52 +82,49 @@ def load_questions_from_cloud():
         sheet = client.open("grammar_data")
         ws_q = sheet.worksheet("Questions")
         
-        # 見出しがないシートでも読めるように get_all_values() を使用
         records = ws_q.get_all_values()
         if not records: return []
 
-        # 1行目が見出し（"id"など）ならスキップし、そうでないなら0行目から読み込む
+        # 1行目が見出し（"id"など）ならスキップ
         start_idx = 1 if records[0] and str(records[0][0]).lower() == 'id' else 0
 
         q_data = []
         for i, row in enumerate(records[start_idx:]):
-            # エラー防止：列数が足りない場合は空文字で埋める
-            row = row + [''] * (10 - len(row))
+            # A〜J列まで確実に取得できるよう、足りない列を空文字で埋める（最低10列）
+            row = row + [''] * max(0, 10 - len(row))
 
-            # A列(0): ID, B列(1): Section, C列(2): 問題
+            # 基本情報 (A:0, B:1, C:2)
             q_id = int(row[0]) if str(row[0]).isdigit() else (i + 1)
             section = int(row[1]) if str(row[1]).isdigit() else 0
             question = str(row[2])
 
-            ans_raw = str(row[7]).strip() # H列の値
+            # H列(7)の答え番号, I列(8)の和訳, J列(9)の解説
+            ans_raw = str(row[7]).strip() 
+            translation = str(row[8]).strip()
+            explanation = str(row[9]).strip()
 
-            # H列が「1〜4」などの数字なら【選択式】、そうでないなら【記述式】と判定
-            if ans_raw.isdigit() and len(ans_raw) == 1:
-                # --- 選択式問題 ---
-                # D(3), E(4), F(5), G(6)列を選択肢としてリスト化
-                options = [str(row[3]), str(row[4]), str(row[5]), str(row[6])]
-                options = [opt for opt in options if opt.strip() != '']
+            # H列が「1, 2, 3, 4」のどれかなら【選択式】と判定
+            if ans_raw in ['1', '2', '3', '4']:
+                # D(3), E(4), F(5), G(6)列を選択肢として取得
+                options = [str(row[3]).strip(), str(row[4]).strip(), str(row[5]).strip(), str(row[6]).strip()]
                 
-                # スプレッドシート上の答えが「4」なら、プログラム用に「3」(0スタート)に変換
-                ans_idx = int(ans_raw) - 1
+                ans_idx = int(ans_raw) - 1 # 1〜4 を 0〜3 のインデックスに変換
                 correct_answer = options[ans_idx] if 0 <= ans_idx < len(options) else ""
-                explanation = str(row[8]) # I列が解説
                 
                 q_data.append({
                     "id": q_id,
                     "section": section,
                     "question": question,
-                    "options": options,
+                    "options": [opt for opt in options if opt], # 空の選択肢は除外して表示
                     "answer": ans_idx,
                     "correct_answer": correct_answer,
                     "explanation": explanation,
-                    "translation": ""
+                    "translation": translation
                 })
             else:
-                # --- 記述式問題 ---
-                # H列が数字じゃない（解説が入っている）場合
-                correct_answer = str(row[3]).strip() # D列を答えとする
-                explanation = str(row[7]) # H列を解説とする
+                # --- 【記述式・並べ替え問題】 ---
+                # H列が空欄などの場合は、D列(3)を「正解」として取得
+                correct_answer = str(row[3]).strip() 
                 
                 q_data.append({
                     "id": q_id,
@@ -137,7 +134,7 @@ def load_questions_from_cloud():
                     "answer": correct_answer,
                     "correct_answer": correct_answer,
                     "explanation": explanation,
-                    "translation": ""
+                    "translation": translation
                 })
 
         return q_data
@@ -177,7 +174,6 @@ def load_progress_from_cloud():
     except Exception as e:
         return False, f"通信エラー: {str(e)}", {}
 
-# プログレスデータのローカルロード＆初期化
 def load_progress(cloud_data=None):
     p = cloud_data if cloud_data else {}
     if not p and os.path.exists(PROGRESS_PATH):
@@ -185,7 +181,6 @@ def load_progress(cloud_data=None):
             with open(PROGRESS_PATH, 'r', encoding='utf-8') as f: p = json.load(f)
         except: pass
 
-    # 初期化ロジック
     if "stats" not in p: p["stats"] = {"streak": 0, "last_date": "", "today_count": 0, "history": {}}
     if "history" not in p["stats"]: p["stats"]["history"] = {}
     if "seq_progress" not in p["stats"]: p["stats"]["seq_progress"] = {"ALL": 0}
@@ -193,7 +188,6 @@ def load_progress(cloud_data=None):
     if "review_list" not in p: p["review_list"] = []
     if "chapter_wrongs" not in p: p["chapter_wrongs"] = []
     
-    # 古いデータの互換性維持
     if "items" not in p:
         items_dict = {}
         for k, v in list(p.items()):
@@ -216,7 +210,6 @@ def sm2_update(ease, interval):
     ease = min(3.0, ease + 0.1)
     return ease, interval
 
-# --- 記述式の正誤判定 ---
 def check_text_answer(user_input, correct_ans):
     return str(user_input).strip().lower() == str(correct_ans).strip().lower()
 
@@ -231,14 +224,12 @@ if not st.session_state.auto_loaded:
         st.session_state.cloud_p_data = data
     st.session_state.auto_loaded = True
 
-# ★データ初期化（スプレッドシートから読み込み）
 q_data = load_questions_from_cloud()
 p_data = load_progress(st.session_state.cloud_p_data)
 
 now = datetime.now()
 today_str = now.strftime("%Y-%m-%d")
 
-# ストリーク（連続日数）と今日の記録の更新
 if p_data["stats"].get("last_date") != today_str:
     yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
     if p_data["stats"].get("last_date") == yesterday: p_data["stats"]["streak"] += 1
@@ -249,7 +240,6 @@ if p_data["stats"].get("last_date") != today_str:
     if today_str not in p_data["stats"]["history"]: p_data["stats"]["history"][today_str] = 0
     save_p(p_data)
 
-# セッションステート初期化
 if 'view' not in st.session_state: st.session_state.view = "HOME"
 if 'queue' not in st.session_state: st.session_state.queue = []
 if 'idx' not in st.session_state: st.session_state.idx = 0
@@ -292,7 +282,7 @@ with st.sidebar:
             
     if st.button("🔄 問題データを再読み込み"):
         load_questions_from_cloud.clear()
-        st.success("スプレッドシートから問題データを再取得しました！")
+        st.success("スプレッドシートから最新データを再取得しました！")
         st.rerun()
     
     st.divider()
@@ -432,8 +422,9 @@ elif st.session_state.view == "QUIZ":
 
             if is_mcq:
                 cols = st.columns(2)
+                # 有効な選択肢だけをボタンとして表示
                 for i, opt in enumerate(q['options']):
-                    # optionsに中身があればボタン表示
+                    # 元のインデックス(0〜3)と一致させるためにenumerateを利用
                     if cols[i % 2].button(f"{i+1}. {opt}", key=f"opt_{q['id']}_{i}"):
                         st.session_state.ans_flag = True
                         st.session_state.is_correct = (i == q['answer'])
@@ -455,15 +446,19 @@ elif st.session_state.view == "QUIZ":
                 st.rerun()
 
         else:
+            # フィードバック画面
             if st.session_state.is_correct:
                 st.markdown('<div class="feedback-correct">⭕ 正解です！素晴らしい！</div>', unsafe_allow_html=True)
             else:
                 correct_txt = q['correct_answer']
                 st.markdown(f'<div class="feedback-wrong">❌ 不正解...<br>正解: {correct_txt}</div>', unsafe_allow_html=True)
             
+            # 【修正完了】和訳と解説を正しく表示
             if q.get('translation'):
                 st.write(f"**【日本語訳】** {q.get('translation')}")
-            st.info(f"**【解説】**\n{q.get('explanation', '解説はありません。')}")
+            
+            if q.get('explanation'):
+                st.info(f"**【解説】**\n{q.get('explanation')}")
             
             if st.button("次の問題へ ➡️", type="primary"):
                 qid = str(q['id'])
