@@ -3,6 +3,7 @@ import json
 import random
 import os
 import ast
+import re
 from datetime import datetime, timedelta
 
 # --- スプレッドシート通信用ライブラリ ---
@@ -71,7 +72,7 @@ def get_gspread_client():
         raise Exception("鍵（secret）が見つかりません。")
     return gspread.authorize(creds)
 
-# ★ 【修正完了】スプレッドシートの列構成（A〜J列）に完全一致させました ★
+# ★ 【修正完了】スプレッドシートの列構成に完全に合わせました ★
 @st.cache_data(ttl=3600)
 def load_questions_from_cloud():
     if not GSPREAD_AVAILABLE:
@@ -85,29 +86,29 @@ def load_questions_from_cloud():
         records = ws_q.get_all_values()
         if not records: return []
 
-        # 1行目が見出し（"id"など）ならスキップ
+        # 1行目が見出しならスキップ
         start_idx = 1 if records[0] and str(records[0][0]).lower() == 'id' else 0
 
         q_data = []
         for i, row in enumerate(records[start_idx:]):
-            # A〜J列まで確実に取得できるよう、足りない列を空文字で埋める（最低10列）
+            # 確実に10列(A〜J列)以上あるように空文字で埋める
             row = row + [''] * max(0, 10 - len(row))
 
-            # 基本情報 (A:0, B:1, C:2)
-            q_id = int(row[0]) if str(row[0]).isdigit() else (i + 1)
-            section = int(row[1]) if str(row[1]).isdigit() else 0
-            question = str(row[2])
+            q_id = int(row[0]) if str(row[0]).isdigit() else (i + 1) # A列
+            section = int(row[1]) if str(row[1]).isdigit() else 0    # B列
+            question = str(row[2]).strip()                           # C列
 
-            # H列(7)の答え番号, I列(8)の和訳, J列(9)の解説
-            ans_raw = str(row[7]).strip() 
+            # 選択肢 D列, E列, F列, G列
+            opt_raw = [str(row[3]).strip(), str(row[4]).strip(), str(row[5]).strip(), str(row[6]).strip()]
+            options = [opt for opt in opt_raw if opt] # 空欄は除外
+
+            # ★ H列: 答え, I列: 和訳, J列: 解説 ★
+            ans_raw = str(row[7]).strip()
             translation = str(row[8]).strip()
             explanation = str(row[9]).strip()
 
-            # H列が「1, 2, 3, 4」のどれかなら【選択式】と判定
-            if ans_raw in ['1', '2', '3', '4']:
-                # D(3), E(4), F(5), G(6)列を選択肢として取得
-                options = [str(row[3]).strip(), str(row[4]).strip(), str(row[5]).strip(), str(row[6]).strip()]
-                
+            # H列が「1, 2, 3, 4」の数字で、かつ選択肢が2個以上あれば【選択式問題】
+            if ans_raw in ['1', '2', '3', '4'] and len(options) > 1:
                 ans_idx = int(ans_raw) - 1 # 1〜4 を 0〜3 のインデックスに変換
                 correct_answer = options[ans_idx] if 0 <= ans_idx < len(options) else ""
                 
@@ -115,24 +116,22 @@ def load_questions_from_cloud():
                     "id": q_id,
                     "section": section,
                     "question": question,
-                    "options": [opt for opt in options if opt], # 空の選択肢は除外して表示
+                    "options": options,
                     "answer": ans_idx,
                     "correct_answer": correct_answer,
                     "explanation": explanation,
                     "translation": translation
                 })
             else:
-                # --- 【記述式・並べ替え問題】 ---
-                # H列が空欄などの場合は、D列(3)を「正解」として取得
-                correct_answer = str(row[3]).strip() 
-                
+                # 【記述式・並べ替え問題】
+                # 答えはそのまま H列(ans_raw) を使用する
                 q_data.append({
                     "id": q_id,
                     "section": section,
                     "question": question,
                     "options": [],
-                    "answer": correct_answer,
-                    "correct_answer": correct_answer,
+                    "answer": ans_raw,
+                    "correct_answer": ans_raw,
                     "explanation": explanation,
                     "translation": translation
                 })
@@ -210,8 +209,11 @@ def sm2_update(ease, interval):
     ease = min(3.0, ease + 0.1)
     return ease, interval
 
+# ★ 記述式・並べ替えの判定を強化（余分な空白を無視する）
 def check_text_answer(user_input, correct_ans):
-    return str(user_input).strip().lower() == str(correct_ans).strip().lower()
+    u = re.sub(r'\s+', ' ', str(user_input).strip().lower())
+    c = re.sub(r'\s+', ' ', str(correct_ans).strip().lower())
+    return u == c
 
 # --- ★ オートロード機能 ★ ---
 if 'auto_loaded' not in st.session_state:
@@ -300,7 +302,7 @@ if st.session_state.view == "HOME":
     st.title("英文法 忘却曲線マスター Pro")
 
     if not q_data:
-        st.warning("⚠️ 問題データが読み込めていません。スプレッドシートの「Questions」シートの構成を確認してください。")
+        st.warning("⚠️ 問題データが読み込めていません。サイドバーの「🔄 問題データを再読み込み」を押してください。")
         st.stop()
 
     tab_seq, tab_rand, tab_eb, tab_chap, tab_review, tab_record = st.tabs([
@@ -417,20 +419,17 @@ elif st.session_state.view == "QUIZ":
         st.markdown(f'<div class="q-card"><b>Question:</b><br>{q["question"]}</div>', unsafe_allow_html=True)
 
         if not st.session_state.ans_flag:
-            # --- 選択式 or 記述式の判定 ---
             is_mcq = 'options' in q and isinstance(q['options'], list) and len(q['options']) > 0
 
             if is_mcq:
                 cols = st.columns(2)
-                # 有効な選択肢だけをボタンとして表示
                 for i, opt in enumerate(q['options']):
-                    # 元のインデックス(0〜3)と一致させるためにenumerateを利用
                     if cols[i % 2].button(f"{i+1}. {opt}", key=f"opt_{q['id']}_{i}"):
                         st.session_state.ans_flag = True
                         st.session_state.is_correct = (i == q['answer'])
                         st.rerun()
             else:
-                user_ans = st.text_input("✍️ 答えを入力してください", key=f"text_ans_{q['id']}")
+                user_ans = st.text_input("✍️ 答えを入力してください (例: dead for)", key=f"text_ans_{q['id']}")
                 if st.button("回答を送信", type="primary"):
                     if user_ans.strip():
                         st.session_state.ans_flag = True
@@ -446,14 +445,12 @@ elif st.session_state.view == "QUIZ":
                 st.rerun()
 
         else:
-            # フィードバック画面
             if st.session_state.is_correct:
                 st.markdown('<div class="feedback-correct">⭕ 正解です！素晴らしい！</div>', unsafe_allow_html=True)
             else:
                 correct_txt = q['correct_answer']
                 st.markdown(f'<div class="feedback-wrong">❌ 不正解...<br>正解: {correct_txt}</div>', unsafe_allow_html=True)
             
-            # 【修正完了】和訳と解説を正しく表示
             if q.get('translation'):
                 st.write(f"**【日本語訳】** {q.get('translation')}")
             
