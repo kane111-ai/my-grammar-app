@@ -4,7 +4,7 @@ import random
 import os
 import ast
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # --- スプレッドシート通信用ライブラリ ---
 try:
@@ -52,9 +52,9 @@ def get_chapter_name(sec):
             if start <= s <= end: return name
         return "イディオム" if s >= 220 else "その他"
     except: return "会話表現"
-
+JST = timezone(timedelta(hours=+9), 'JST')
 def get_logical_today_date():
-    now = datetime.now()
+    now = datetime.now(JST)
     if now.hour < 7: return (now - timedelta(days=1)).date()
     return now.date()
 
@@ -532,3 +532,4 @@ elif st.session_state.view == "QUIZ":
         if st.button("🏠 ホームへ戻る", type="primary"):
             st.session_state.view = "HOME"
             st.rerun()
+
