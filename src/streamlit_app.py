@@ -53,12 +53,13 @@ def get_chapter_name(sec):
         return "イディオム" if s >= 220 else "その他"
     except: return "会話表現"
 
-def get_next_review(interval):
+def get_logical_today_date():
     now = datetime.now()
-    if now.hour < 7: base_date = now.date() - timedelta(days=1)
-    else: base_date = now.date()
-    next_date = base_date + timedelta(days=interval)
-    return datetime(next_date.year, next_date.month, next_date.day, 7, 0, 0).isoformat()
+    if now.hour < 7: return (now - timedelta(days=1)).date()
+    return now.date()
+
+today_date = get_logical_today_date()
+today_str = str(today_date)
 
 # --- クラウド同期機能 (GSpread) ---
 def get_gspread_client():
@@ -72,7 +73,6 @@ def get_gspread_client():
         raise Exception("鍵（secret）が見つかりません。")
     return gspread.authorize(creds)
 
-# ★ 【修正完了】スプレッドシートの列構成に完全に合わせました ★
 @st.cache_data(ttl=3600)
 def load_questions_from_cloud():
     if not GSPREAD_AVAILABLE:
@@ -86,54 +86,37 @@ def load_questions_from_cloud():
         records = ws_q.get_all_values()
         if not records: return []
 
-        # 1行目が見出しならスキップ
         start_idx = 1 if records[0] and str(records[0][0]).lower() == 'id' else 0
 
         q_data = []
         for i, row in enumerate(records[start_idx:]):
-            # 確実に10列(A〜J列)以上あるように空文字で埋める
             row = row + [''] * max(0, 10 - len(row))
 
-            q_id = int(row[0]) if str(row[0]).isdigit() else (i + 1) # A列
-            section = int(row[1]) if str(row[1]).isdigit() else 0    # B列
-            question = str(row[2]).strip()                           # C列
+            q_id = int(row[0]) if str(row[0]).isdigit() else (i + 1)
+            section = int(row[1]) if str(row[1]).isdigit() else 0
+            question = str(row[2]).strip()
 
-            # 選択肢 D列, E列, F列, G列
             opt_raw = [str(row[3]).strip(), str(row[4]).strip(), str(row[5]).strip(), str(row[6]).strip()]
-            options = [opt for opt in opt_raw if opt] # 空欄は除外
+            options = [opt for opt in opt_raw if opt]
 
-            # ★ H列: 答え, I列: 和訳, J列: 解説 ★
             ans_raw = str(row[7]).strip()
             translation = str(row[8]).strip()
             explanation = str(row[9]).strip()
 
-            # H列が「1, 2, 3, 4」の数字で、かつ選択肢が2個以上あれば【選択式問題】
             if ans_raw in ['1', '2', '3', '4'] and len(options) > 1:
-                ans_idx = int(ans_raw) - 1 # 1〜4 を 0〜3 のインデックスに変換
+                ans_idx = int(ans_raw) - 1
                 correct_answer = options[ans_idx] if 0 <= ans_idx < len(options) else ""
                 
                 q_data.append({
-                    "id": q_id,
-                    "section": section,
-                    "question": question,
-                    "options": options,
-                    "answer": ans_idx,
-                    "correct_answer": correct_answer,
-                    "explanation": explanation,
-                    "translation": translation
+                    "id": q_id, "section": section, "question": question,
+                    "options": options, "answer": ans_idx, "correct_answer": correct_answer,
+                    "explanation": explanation, "translation": translation
                 })
             else:
-                # 【記述式・並べ替え問題】
-                # 答えはそのまま H列(ans_raw) を使用する
                 q_data.append({
-                    "id": q_id,
-                    "section": section,
-                    "question": question,
-                    "options": [],
-                    "answer": ans_raw,
-                    "correct_answer": ans_raw,
-                    "explanation": explanation,
-                    "translation": translation
+                    "id": q_id, "section": section, "question": question,
+                    "options": [], "answer": ans_raw, "correct_answer": ans_raw,
+                    "explanation": explanation, "translation": translation
                 })
 
         return q_data
@@ -152,8 +135,7 @@ def sync_to_cloud(p_data):
         
         try: ws_hist = sheet.worksheet("History")
         except: ws_hist = sheet.add_worksheet(title="History", rows="1000", cols="5")
-        today = datetime.now().strftime("%Y-%m-%d")
-        ws_hist.append_row([today, p_data["stats"]["today_count"]])
+        ws_hist.append_row([today_str, p_data["stats"]["today_count"]])
         return True, "クラウドにセーブしました！"
     except Exception as e:
         return False, f"通信エラー: {str(e)}"
@@ -195,6 +177,18 @@ def load_progress(cloud_data=None):
                 del p[k]
         p["items"] = items_dict
 
+    # 互換性パッチ
+    for qid, item in list(p["items"].items()):
+        if "ease" in item:
+            old_int = item.get("interval", 1)
+            new_lvl = 5 if old_int >= 30 else 4 if old_int >= 15 else 3 if old_int >= 7 else 2 if old_int >= 3 else 1
+            p["items"][qid] = {
+                "level": new_lvl,
+                "wrong_count": 0,
+                "next_review": str(item.get("next_review", today_str))[:10],
+                "last_tested_date": ""
+            }
+
     return p
 
 def save_p(p):
@@ -202,20 +196,12 @@ def save_p(p):
     with open(PROGRESS_PATH, 'w', encoding='utf-8') as f:
         json.dump(p, f, ensure_ascii=False, indent=4)
 
-def sm2_update(ease, interval):
-    if interval == 0: interval = 1
-    elif interval == 1: interval = 3
-    else: interval = round(interval * ease)
-    ease = min(3.0, ease + 0.1)
-    return ease, interval
-
-# ★ 記述式・並べ替えの判定を強化（余分な空白を無視する）
 def check_text_answer(user_input, correct_ans):
     u = re.sub(r'\s+', ' ', str(user_input).strip().lower())
     c = re.sub(r'\s+', ' ', str(correct_ans).strip().lower())
     return u == c
 
-# --- ★ オートロード機能 ★ ---
+# --- オートロード機能 ---
 if 'auto_loaded' not in st.session_state:
     st.session_state.auto_loaded = False
     st.session_state.cloud_p_data = {}
@@ -229,11 +215,8 @@ if not st.session_state.auto_loaded:
 q_data = load_questions_from_cloud()
 p_data = load_progress(st.session_state.cloud_p_data)
 
-now = datetime.now()
-today_str = now.strftime("%Y-%m-%d")
-
 if p_data["stats"].get("last_date") != today_str:
-    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    yesterday = str(today_date - timedelta(days=1))
     if p_data["stats"].get("last_date") == yesterday: p_data["stats"]["streak"] += 1
     elif p_data["stats"].get("last_date") == "": p_data["stats"]["streak"] = 1
     else: p_data["stats"]["streak"] = 0
@@ -250,7 +233,7 @@ if 'quiz_mode' not in st.session_state: st.session_state.quiz_mode = None
 if 'seq_key' not in st.session_state: st.session_state.seq_key = None
 
 def start_quiz(queue, mode, seq_key=None, start_idx=0):
-    st.session_state.queue = queue
+    st.session_state.queue = list(queue)
     st.session_state.quiz_mode = mode
     st.session_state.seq_key = seq_key
     st.session_state.view = "QUIZ"
@@ -264,6 +247,9 @@ with st.sidebar:
     st.markdown(f'<div class="stat-label">🔥 連続学習日数</div><div class="stat-value">{p_data["stats"]["streak"]} 日</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="stat-label">✅ 今日の回答数</div><div class="stat-value">{p_data["stats"]["today_count"]} 問</div>', unsafe_allow_html=True)
     
+    mastered_count = sum(1 for item in p_data["items"].values() if item.get("level", 0) >= 5)
+    st.markdown(f'<div class="stat-label" style="margin-top:10px;">👑 マスター済み</div><div class="stat-value" style="color:#f1c40f;">{mastered_count} 問</div>', unsafe_allow_html=True)
+
     st.divider()
     
     st.write("☁️ **クラウド同期**")
@@ -333,7 +319,14 @@ if st.session_state.view == "HOME":
 
     with tab_eb:
         st.subheader("忘却曲線テスト")
-        due = [q for q in q_data if str(q['id']) in p_data["items"] and datetime.fromisoformat(p_data["items"][str(q['id'])]['next_review']) <= now]
+        due = []
+        for q in q_data:
+            qid = str(q['id'])
+            if qid in p_data["items"]:
+                item = p_data["items"][qid]
+                if item.get("level", 0) > 0 and item.get("next_review", today_str) <= today_str and item.get("last_tested_date") != today_str:
+                    due.append(q)
+
         st.info(f"今日復習すべき問題: {len(due)}問")
         if st.button("🧠 今日の忘却曲線テストを開始"):
             if due: start_quiz(random.sample(due, len(due)), mode="EB")
@@ -413,7 +406,9 @@ elif st.session_state.view == "QUIZ":
         elif mode == "CHAP_REVIEW": label = "♻️ 章別・復習テスト"
         else: label = "📚 章別学習"
         
-        st.progress((st.session_state.idx) / len(st.session_state.queue))
+        # キューの長さは変わらないのでシンプルな進捗計算に戻す
+        progress_val = min(1.0, st.session_state.idx / max(1, len(st.session_state.queue)))
+        st.progress(progress_val)
         st.caption(f"{label} | {get_chapter_name(q.get('section'))} | ID: {q['id']} ({st.session_state.idx + 1} / {len(st.session_state.queue)})")
         
         st.markdown(f'<div class="q-card"><b>Question:</b><br>{q["question"]}</div>', unsafe_allow_html=True)
@@ -457,47 +452,64 @@ elif st.session_state.view == "QUIZ":
             if q.get('explanation'):
                 st.info(f"**【解説】**\n{q.get('explanation')}")
             
+            # --- 修正版: エンドレスループ廃止 ＆ 復習タブでエビングハウス開始 ---
             if st.button("次の問題へ ➡️", type="primary"):
                 qid = str(q['id'])
                 is_correct = st.session_state.is_correct
 
+                if qid not in p_data["items"]:
+                    p_data["items"][qid] = {"level": 0, "wrong_count": 0, "next_review": today_str, "last_tested_date": ""}
+                
+                item = p_data["items"][qid]
+                curr_lvl = item.get("level", 0)
+                curr_w = item.get("wrong_count", 0)
+                intervals = [0, 1, 3, 7, 15, 30, 60, 90]
+
                 if mode == "EB":
                     if is_correct:
-                        e, i = sm2_update(p_data["items"][qid]['ease'], p_data["items"][qid]['interval'])
-                        p_data["items"][qid] = {"ease": e, "interval": i, "next_review": get_next_review(i)}
+                        new_lvl = curr_lvl + 1
+                        item['level'] = new_lvl
+                        item['next_review'] = str(today_date + timedelta(days=intervals[min(new_lvl, 7)]))
+                        item['last_tested_date'] = today_str
                     else:
-                        if qid in p_data["items"]: del p_data["items"][qid]
-                        if qid not in p_data["review_list"]: p_data["review_list"].append(qid)
+                        item['level'] = max(1, curr_lvl - 1)
+                        item['wrong_count'] = curr_w + 1
+                        # 忘却曲線で間違えた場合も、しっかり復習タブ（総合の苦手）に送る
+                        if qid not in p_data["review_list"]:
+                            p_data["review_list"].append(qid)
 
-                elif mode == "GLOBAL_REVIEW":
+                elif mode in ["GLOBAL_LEARN", "CHAP_LEARN", "CHAP_LEARN_RANDOM", "RANDOM_LEARN"]:
                     if is_correct:
-                        if qid in p_data["review_list"]: p_data["review_list"].remove(qid)
-                        p_data["items"][qid] = {"ease": 2.5, "interval": 1, "next_review": get_next_review(1)}
+                        # 初見で正解したらエビングハウスのレベル1へ
+                        if curr_lvl == 0:
+                            item['level'] = 1
+                            item['next_review'] = str(today_date + timedelta(days=1))
+                            item['last_tested_date'] = today_str
+                    else:
+                        item['wrong_count'] = curr_w + 1
+                        # 間違えたらループさせず、それぞれの苦手リストに登録するだけ
+                        if mode in ["GLOBAL_LEARN", "RANDOM_LEARN"] and qid not in p_data["review_list"]:
+                            p_data["review_list"].append(qid)
+                        elif mode in ["CHAP_LEARN", "CHAP_LEARN_RANDOM"] and qid not in p_data["chapter_wrongs"]:
+                            p_data["chapter_wrongs"].append(qid)
 
-                elif mode == "CHAP_REVIEW":
+                elif mode in ["GLOBAL_REVIEW", "CHAP_REVIEW"]:
                     if is_correct:
-                        if qid in p_data["chapter_wrongs"]: p_data["chapter_wrongs"].remove(qid)
+                        # 復習タブで正解したらリストから除外し、エビングハウスの1歩目（レベル1）をセット
+                        if mode == "GLOBAL_REVIEW" and qid in p_data["review_list"]: p_data["review_list"].remove(qid)
+                        if mode == "CHAP_REVIEW" and qid in p_data["chapter_wrongs"]: p_data["chapter_wrongs"].remove(qid)
+                        
+                        item['level'] = 1
+                        item['next_review'] = str(today_date + timedelta(days=1))
+                        item['last_tested_date'] = today_str
+                    else:
+                        item['wrong_count'] = curr_w + 1
 
-                elif mode == "RANDOM_LEARN":
-                    if not is_correct:
-                        if qid not in p_data["review_list"]: p_data["review_list"].append(qid)
-                        if qid in p_data["items"]: del p_data["items"][qid]
+                # 進捗セーブ
+                if mode in ["GLOBAL_LEARN", "CHAP_LEARN"]:
+                    p_data["stats"]["seq_progress"][st.session_state.seq_key] = st.session_state.idx + 1
+                if mode == "RANDOM_LEARN":
                     p_data["stats"]["random_state"]["idx"] = st.session_state.idx + 1
-
-                elif mode in ["GLOBAL_LEARN", "CHAP_LEARN", "CHAP_LEARN_RANDOM"]:
-                    if is_correct:
-                        if mode == "GLOBAL_LEARN":
-                            if qid not in p_data["items"] and qid not in p_data["review_list"]:
-                                p_data["items"][qid] = {"ease": 2.5, "interval": 1, "next_review": get_next_review(1)}
-                    else:
-                        if mode == "GLOBAL_LEARN":
-                            if qid not in p_data["review_list"]: p_data["review_list"].append(qid)
-                        else:
-                            if qid not in p_data["chapter_wrongs"]: p_data["chapter_wrongs"].append(qid)
-                        if qid in p_data["items"]: del p_data["items"][qid]
-
-                    if mode in ["GLOBAL_LEARN", "CHAP_LEARN"]:
-                        p_data["stats"]["seq_progress"][st.session_state.seq_key] = st.session_state.idx + 1
 
                 p_data["stats"]["today_count"] += 1
                 p_data["stats"]["history"][today_str] = p_data["stats"]["today_count"]
