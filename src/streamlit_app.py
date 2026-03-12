@@ -4,8 +4,8 @@ import random
 import os
 import ast
 import re
-import pandas as pd
 from datetime import datetime, timedelta, timezone
+import pandas as pd  # 📊 グラフ用にpandasを追加
 
 # --- スプレッドシート通信用ライブラリ ---
 try:
@@ -53,6 +53,7 @@ def get_chapter_name(sec):
             if start <= s <= end: return name
         return "イディオム" if s >= 220 else "その他"
     except: return "会話表現"
+
 JST = timezone(timedelta(hours=+9), 'JST')
 def get_logical_today_date():
     now = datetime.now(JST)
@@ -140,8 +141,9 @@ def sync_to_cloud(p_data):
         return True, "クラウドにセーブしました！"
     except Exception as e:
         return False, f"通信エラー: {str(e)}"
+
 def auto_sync_to_cloud(p_data):
-    """画面や履歴を邪魔しない、裏側専用の軽量セーブ機能"""
+    """🤖 画面や履歴を邪魔しない、裏側専用の安全なオートセーブ機能"""
     if not GSPREAD_AVAILABLE: return
     try:
         client = get_gspread_client()
@@ -150,6 +152,7 @@ def auto_sync_to_cloud(p_data):
         ws_save.update(range_name='A1', values=[[json.dumps(p_data, ensure_ascii=False)]])
     except:
         pass # エラーが起きてもユーザーの学習は止めない
+
 def load_progress_from_cloud():
     if not GSPREAD_AVAILABLE: return False, "ライブラリがありません。", {}
     try:
@@ -263,7 +266,7 @@ with st.sidebar:
     st.divider()
     
     st.write("☁️ **クラウド同期**")
-    if st.button("⬆️ セーブする", type="primary"):
+    if st.button("⬆️ 手動でセーブする", type="primary"):
         with st.spinner("通信中..."):
             success, msg = sync_to_cloud(p_data)
             if success: st.success(msg)
@@ -385,13 +388,24 @@ if st.session_state.view == "HOME":
             sorted_history = dict(sorted(history_data.items()))
             st.bar_chart(sorted_history)
 
+        st.divider()
+        # 📊 --- 追加：割合＆数の切り替え可能な章別苦手チャート ---
         st.subheader("📊 章ごとの苦手分析")
         
-        # 総合と章別の苦手リストを合体させて重複を消す
+        chart_mode = st.radio("表示形式を切り替え", ["間違えた「数」", "間違えた「割合（％）」"], horizontal=True)
+
         all_wrongs = list(set(p_data.get("review_list", []) + p_data.get("chapter_wrongs", [])))
         
         if all_wrongs:
-            q_dict = {str(q['id']): q for q in q_data} # 検索用に辞書化
+            q_dict = {str(q['id']): q for q in q_data}
+            
+            # 各章の全問題数をカウント
+            total_counts = {}
+            for q in q_data:
+                chap_name = get_chapter_name(q.get('section'))
+                total_counts[chap_name] = total_counts.get(chap_name, 0) + 1
+                
+            # 各章の苦手な問題数をカウント
             wrong_counts = {}
             for qid in all_wrongs:
                 if qid in q_dict:
@@ -399,18 +413,23 @@ if st.session_state.view == "HOME":
                     wrong_counts[chap_name] = wrong_counts.get(chap_name, 0) + 1
             
             if wrong_counts:
-                # グラフ用にデータフレーム化して、苦手な順（降順）に並び替え
-                df_wrongs = pd.DataFrame(list(wrong_counts.items()), columns=["章名", "苦手な問題数"])
-                df_wrongs = df_wrongs.set_index("章名").sort_values(by="苦手な問題数", ascending=False)
-                # 苦手な箇所なので赤色で表示
-                st.bar_chart(df_wrongs, color="#e74c3c") 
+                plot_data = []
+                for chap, w_count in wrong_counts.items():
+                    t_count = total_counts.get(chap, 1) # ゼロ割防止
+                    if chart_mode == "間違えた「割合（％）」":
+                        # 割合を計算（小数点第1位まで）
+                        val = round((w_count / t_count) * 100, 1)
+                    else:
+                        val = w_count
+                    plot_data.append({"章名": chap, "値": val})
+                
+                df_wrongs = pd.DataFrame(plot_data)
+                df_wrongs = df_wrongs.set_index("章名").sort_values(by="値", ascending=False)
+                
+                # グラフを描画
+                st.bar_chart(df_wrongs, y="値", color="#e74c3c")
         else:
             st.success("🎉 現在、苦手リストに入っている問題はありません！完璧です！")
-        # 👆 --- ここまで追加 --- 👆
-
-        st.divider()
-        st.subheader("⚙️ データの管理")
-        # (以下、元からあるリセット機能のコードが続きます)
 
         st.divider()
         st.subheader("⚙️ データの管理")
@@ -443,7 +462,6 @@ elif st.session_state.view == "QUIZ":
         elif mode == "CHAP_REVIEW": label = "♻️ 章別・復習テスト"
         else: label = "📚 章別学習"
         
-        # キューの長さは変わらないのでシンプルな進捗計算に戻す
         progress_val = min(1.0, st.session_state.idx / max(1, len(st.session_state.queue)))
         st.progress(progress_val)
         st.caption(f"{label} | {get_chapter_name(q.get('section'))} | ID: {q['id']} ({st.session_state.idx + 1} / {len(st.session_state.queue)})")
@@ -489,7 +507,6 @@ elif st.session_state.view == "QUIZ":
             if q.get('explanation'):
                 st.info(f"**【解説】**\n{q.get('explanation')}")
             
-            # --- 修正版: エンドレスループ廃止 ＆ 復習タブでエビングハウス開始 ---
             if st.button("次の問題へ ➡️", type="primary"):
                 qid = str(q['id'])
                 is_correct = st.session_state.is_correct
@@ -511,20 +528,17 @@ elif st.session_state.view == "QUIZ":
                     else:
                         item['level'] = max(1, curr_lvl - 1)
                         item['wrong_count'] = curr_w + 1
-                        # 忘却曲線で間違えた場合も、しっかり復習タブ（総合の苦手）に送る
                         if qid not in p_data["review_list"]:
                             p_data["review_list"].append(qid)
 
                 elif mode in ["GLOBAL_LEARN", "CHAP_LEARN", "CHAP_LEARN_RANDOM", "RANDOM_LEARN"]:
                     if is_correct:
-                        # 初見で正解したらエビングハウスのレベル1へ
                         if curr_lvl == 0:
                             item['level'] = 1
                             item['next_review'] = str(today_date + timedelta(days=1))
                             item['last_tested_date'] = today_str
                     else:
                         item['wrong_count'] = curr_w + 1
-                        # 間違えたらループさせず、それぞれの苦手リストに登録するだけ
                         if mode in ["GLOBAL_LEARN", "RANDOM_LEARN"] and qid not in p_data["review_list"]:
                             p_data["review_list"].append(qid)
                         elif mode in ["CHAP_LEARN", "CHAP_LEARN_RANDOM"] and qid not in p_data["chapter_wrongs"]:
@@ -532,7 +546,6 @@ elif st.session_state.view == "QUIZ":
 
                 elif mode in ["GLOBAL_REVIEW", "CHAP_REVIEW"]:
                     if is_correct:
-                        # 復習タブで正解したらリストから除外し、エビングハウスの1歩目（レベル1）をセット
                         if mode == "GLOBAL_REVIEW" and qid in p_data["review_list"]: p_data["review_list"].remove(qid)
                         if mode == "CHAP_REVIEW" and qid in p_data["chapter_wrongs"]: p_data["chapter_wrongs"].remove(qid)
                         
@@ -551,14 +564,15 @@ elif st.session_state.view == "QUIZ":
                 p_data["stats"]["today_count"] += 1
                 p_data["stats"]["history"][today_str] = p_data["stats"]["today_count"]
                 save_p(p_data)
-
+                
+                # 🤖 --- 追加：5問解くごとに裏側で安全にオートセーブ ---
                 if 'action_count' not in st.session_state: st.session_state.action_count = 0
                 st.session_state.action_count += 1
                 
-                if st.session_state.action_count >= 5: # 5問解くごとにクラウド保存
+                if st.session_state.action_count >= 5:
                     auto_sync_to_cloud(p_data)
                     st.session_state.action_count = 0
-                    
+
                 st.session_state.ans_flag = False
                 st.session_state.idx += 1
                 st.rerun()
@@ -576,5 +590,3 @@ elif st.session_state.view == "QUIZ":
         if st.button("🏠 ホームへ戻る", type="primary"):
             st.session_state.view = "HOME"
             st.rerun()
-
-
