@@ -4,6 +4,7 @@ import random
 import os
 import ast
 import re
+import pandas as pd
 from datetime import datetime, timedelta, timezone
 
 # --- スプレッドシート通信用ライブラリ ---
@@ -139,7 +140,16 @@ def sync_to_cloud(p_data):
         return True, "クラウドにセーブしました！"
     except Exception as e:
         return False, f"通信エラー: {str(e)}"
-
+def auto_sync_to_cloud(p_data):
+    """画面や履歴を邪魔しない、裏側専用の軽量セーブ機能"""
+    if not GSPREAD_AVAILABLE: return
+    try:
+        client = get_gspread_client()
+        sheet = client.open("grammar_data") 
+        ws_save = sheet.worksheet("SaveData")
+        ws_save.update(range_name='A1', values=[[json.dumps(p_data, ensure_ascii=False)]])
+    except:
+        pass # エラーが起きてもユーザーの学習は止めない
 def load_progress_from_cloud():
     if not GSPREAD_AVAILABLE: return False, "ライブラリがありません。", {}
     try:
@@ -375,6 +385,33 @@ if st.session_state.view == "HOME":
             sorted_history = dict(sorted(history_data.items()))
             st.bar_chart(sorted_history)
 
+        st.subheader("📊 章ごとの苦手分析")
+        
+        # 総合と章別の苦手リストを合体させて重複を消す
+        all_wrongs = list(set(p_data.get("review_list", []) + p_data.get("chapter_wrongs", [])))
+        
+        if all_wrongs:
+            q_dict = {str(q['id']): q for q in q_data} # 検索用に辞書化
+            wrong_counts = {}
+            for qid in all_wrongs:
+                if qid in q_dict:
+                    chap_name = get_chapter_name(q_dict[qid].get('section'))
+                    wrong_counts[chap_name] = wrong_counts.get(chap_name, 0) + 1
+            
+            if wrong_counts:
+                # グラフ用にデータフレーム化して、苦手な順（降順）に並び替え
+                df_wrongs = pd.DataFrame(list(wrong_counts.items()), columns=["章名", "苦手な問題数"])
+                df_wrongs = df_wrongs.set_index("章名").sort_values(by="苦手な問題数", ascending=False)
+                # 苦手な箇所なので赤色で表示
+                st.bar_chart(df_wrongs, color="#e74c3c") 
+        else:
+            st.success("🎉 現在、苦手リストに入っている問題はありません！完璧です！")
+        # 👆 --- ここまで追加 --- 👆
+
+        st.divider()
+        st.subheader("⚙️ データの管理")
+        # (以下、元からあるリセット機能のコードが続きます)
+
         st.divider()
         st.subheader("⚙️ データの管理")
         if 'confirm_reset' not in st.session_state: st.session_state.confirm_reset = False
@@ -514,7 +551,14 @@ elif st.session_state.view == "QUIZ":
                 p_data["stats"]["today_count"] += 1
                 p_data["stats"]["history"][today_str] = p_data["stats"]["today_count"]
                 save_p(p_data)
+
+                if 'action_count' not in st.session_state: st.session_state.action_count = 0
+                st.session_state.action_count += 1
                 
+                if st.session_state.action_count >= 5: # 5問解くごとにクラウド保存
+                    auto_sync_to_cloud(p_data)
+                    st.session_state.action_count = 0
+                    
                 st.session_state.ans_flag = False
                 st.session_state.idx += 1
                 st.rerun()
@@ -532,4 +576,5 @@ elif st.session_state.view == "QUIZ":
         if st.button("🏠 ホームへ戻る", type="primary"):
             st.session_state.view = "HOME"
             st.rerun()
+
 
